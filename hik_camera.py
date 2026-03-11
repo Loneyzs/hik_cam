@@ -2,6 +2,7 @@
 
 import sys
 import os
+import platform
 import numpy as np
 import threading
 import time
@@ -17,11 +18,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "MvImport"))
 from MvCameraControl_class import *
 
 
+# 获取平台对应的回调函数类型
+def get_callback_functype():
+    """获取平台对应的回调函数类型"""
+    if platform.system() == 'Windows':
+        if sys.maxsize <= 2**32:
+            return WINFUNCTYPE
+        else:
+            return CFUNCTYPE
+    else:
+        return CFUNCTYPE
+
+
 class HikCamera:
     """
-    海康工业相机高性能封装类
-    - 多线程架构，守护线程循环抓图
-    - 零拷贝优化，减少内存操作
+    海康工业相机高性能封装类（回调模式）
+    - 使用SDK回调机制，性能最优
+    - 预分配缓冲区，减少内存操作
     - 支持BGR和灰度两种输出格式
     """
 
@@ -36,9 +49,8 @@ class HikCamera:
         self.is_opened = False
         self.color_mode = color_mode.lower()
 
-        # 多线程相关
-        self._capture_thread = None
-        self._running = False
+        # 回调相关
+        self._callback_func = None
         self._lock = threading.Lock()
         self._latest_frame = None
         self._frame_count = 0
@@ -46,6 +58,10 @@ class HikCamera:
         # 性能统计
         self.fps = 0.0
         self._last_time = 0
+
+        # 预分配转换缓冲区
+        self._convert_buffer = None
+        self._convert_param = None
 
     def init(self):
         """初始化SDK并枚举设备"""
@@ -75,7 +91,7 @@ class HikCamera:
             return False
 
     def open(self, index=0):
-        """打开指定索引的相机并启动采集线程"""
+        """打开指定索引的相机并注册回调"""
         if self.device_list is None:
             print("请先调用init()初始化")
             return False
@@ -106,6 +122,11 @@ class HikCamera:
                 if int(nPacketSize) > 0:
                     self.cam.MV_CC_SetIntValue("GevSCPSPacketSize", nPacketSize)
 
+            # 增加缓存节点数，防止高帧率丢帧
+            ret = self.cam.MV_CC_SetImageNodeNum(10)
+            if ret != 0:
+                print(f"警告: 设置缓存节点失败! 错误码: 0x{ret:x}")
+
             # 设置触发模式为off
             ret = self.cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF)
             if ret != 0:
@@ -115,6 +136,17 @@ class HikCamera:
             # 设置Bayer转换质量
             self.cam.MV_CC_SetBayerCvtQuality(1)
 
+            # 创建并注册回调函数
+            self._callback_func = self._create_callback()
+            ret = self.cam.MV_CC_RegisterImageCallBackEx2(
+                self._callback_func,
+                None,
+                True,  # bAutoFree=True，SDK自动释放内存
+            )
+            if ret != 0:
+                print(f"注册回调失败! 错误码: 0x{ret:x}")
+                return False
+
             # 开始取流
             ret = self.cam.MV_CC_StartGrabbing()
             if ret != 0:
@@ -122,24 +154,15 @@ class HikCamera:
                 return False
 
             self.is_opened = True
-
-            # 启动采集线程
-            self._running = True
-            self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
-            self._capture_thread.start()
-
-            print("相机打开成功，采集线程已启动")
+            print("相机打开成功，回调已注册")
             return True
 
         except Exception as e:
             print(f"打开相机异常: {e}")
             return False
 
-    def _capture_loop(self):
-        """采集线程主循环"""
-        stOutFrame = MV_FRAME_OUT()
-        memset(byref(stOutFrame), 0, sizeof(stOutFrame))
-
+    def _create_callback(self):
+        """创建图像回调函数"""
         # 根据颜色模式设置目标像素格式
         if self.color_mode == "gray":
             dst_pixel_type = PixelType_Gvsp_Mono8
@@ -148,68 +171,72 @@ class HikCamera:
             dst_pixel_type = PixelType_Gvsp_BGR8_Packed
             channels = 3
 
-        while self._running:
+        # 预分配转换缓冲区（按最大分辨率预分配）
+        max_buffer_size = 4096 * 3072 * channels
+        self._convert_buffer = (c_ubyte * max_buffer_size)()
+
+        self._convert_param = MV_CC_PIXEL_CONVERT_PARAM_EX()
+        memset(byref(self._convert_param), 0, sizeof(self._convert_param))
+        self._convert_param.pDstBuffer = self._convert_buffer
+        self._convert_param.nDstBufferSize = max_buffer_size
+        self._convert_param.enDstPixelType = dst_pixel_type
+
+        # 闭包捕获变量
+        cam_ref = self
+        convert_param = self._convert_param
+        convert_buffer = self._convert_buffer
+
+        def image_callback(pstFrame, pUser, bAutoFree):
             try:
-                # 获取一帧图像
-                ret = self.cam.MV_CC_GetImageBuffer(stOutFrame, 100)
-                if ret != 0 or stOutFrame.pBufAddr is None:
-                    continue
+                stFrame = cast(pstFrame, POINTER(MV_FRAME_OUT)).contents
+                if stFrame.pBufAddr is None:
+                    return
 
-                # 准备转换参数
-                width = stOutFrame.stFrameInfo.nWidth
-                height = stOutFrame.stFrameInfo.nHeight
-                buffer_size = width * height * channels
+                width = stFrame.stFrameInfo.nWidth
+                height = stFrame.stFrameInfo.nHeight
 
-                stConvertParam = MV_CC_PIXEL_CONVERT_PARAM_EX()
-                memset(byref(stConvertParam), 0, sizeof(stConvertParam))
-
-                stConvertParam.nWidth = width
-                stConvertParam.nHeight = height
-                stConvertParam.pSrcData = stOutFrame.pBufAddr
-                stConvertParam.nSrcDataLen = stOutFrame.stFrameInfo.nFrameLen
-                stConvertParam.enSrcPixelType = stOutFrame.stFrameInfo.enPixelType
-                stConvertParam.enDstPixelType = dst_pixel_type
-                stConvertParam.pDstBuffer = (c_ubyte * buffer_size)()
-                stConvertParam.nDstBufferSize = buffer_size
+                # 更新转换参数（复用预分配缓冲区）
+                convert_param.nWidth = width
+                convert_param.nHeight = height
+                convert_param.pSrcData = stFrame.pBufAddr
+                convert_param.nSrcDataLen = stFrame.stFrameInfo.nFrameLen
+                convert_param.enSrcPixelType = stFrame.stFrameInfo.enPixelType
 
                 # 转换像素格式
-                ret = self.cam.MV_CC_ConvertPixelTypeEx(stConvertParam)
+                ret = cam_ref.cam.MV_CC_ConvertPixelTypeEx(convert_param)
                 if ret != 0:
-                    self.cam.MV_CC_FreeImageBuffer(stOutFrame)
-                    continue
+                    return
 
-                # 零拷贝转换为numpy数组
-                frame = np.ctypeslib.as_array(
-                    stConvertParam.pDstBuffer, shape=(height, width, channels) if channels > 1 else (height, width)
-                ).copy()
-
-                # 释放图像缓冲区
-                self.cam.MV_CC_FreeImageBuffer(stOutFrame)
+                # 从预分配缓冲区直接构建numpy数组
+                frame_size = width * height * channels
+                shape = (height, width, channels) if channels > 1 else (height, width)
+                frame = np.frombuffer(
+                    convert_buffer, dtype=np.uint8, count=frame_size
+                ).reshape(shape).copy()
 
                 # 更新最新帧
-                with self._lock:
-                    self._latest_frame = frame
-                    self._frame_count += 1
+                with cam_ref._lock:
+                    cam_ref._latest_frame = frame
+                    cam_ref._frame_count += 1
 
                     # 计算FPS
                     current_time = time.time()
-                    if self._last_time > 0:
-                        elapsed = current_time - self._last_time
+                    if cam_ref._last_time > 0:
+                        elapsed = current_time - cam_ref._last_time
                         if elapsed > 0:
-                            self.fps = 1.0 / elapsed
-                    self._last_time = current_time
+                            cam_ref.fps = 1.0 / elapsed
+                    cam_ref._last_time = current_time
 
             except Exception as e:
-                print(f"采集线程异常: {e}")
-                if stOutFrame.pBufAddr is not None:
-                    try:
-                        self.cam.MV_CC_FreeImageBuffer(stOutFrame)
-                    except:
-                        pass
+                print(f"回调异常: {e}")
+
+        # 获取平台对应的回调函数类型
+        CALLBACK_TYPE = get_callback_functype()(None, POINTER(MV_FRAME_OUT), c_void_p, c_bool)
+        return CALLBACK_TYPE(image_callback)
 
     def read(self):
         """
-        读取最新的一帧图像
+        读取最新的一帧图像（返回副本）
         返回: (ret, frame)
             ret: bool, 是否成功读取
             frame: numpy.ndarray, BGR或灰度格式的图像
@@ -220,7 +247,6 @@ class HikCamera:
         with self._lock:
             if self._latest_frame is None:
                 return False, None
-            # 返回副本，避免外部修改
             return True, self._latest_frame.copy()
 
     def read_latest(self):
@@ -252,12 +278,6 @@ class HikCamera:
 
     def release(self):
         """释放相机资源"""
-        # 停止采集线程
-        if self._running:
-            self._running = False
-            if self._capture_thread is not None:
-                self._capture_thread.join(timeout=2.0)
-
         if self.cam is not None:
             try:
                 if self.is_opened:
