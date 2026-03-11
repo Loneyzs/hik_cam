@@ -35,19 +35,14 @@ class HikCamera:
     海康工业相机高性能封装类（回调模式）
     - 使用SDK回调机制，性能最优
     - 预分配缓冲区，减少内存操作
-    - 支持BGR和灰度两种输出格式
+    - 输出BGR格式图像
     """
 
-    def __init__(self, color_mode="bgr"):
-        """
-        初始化相机
-        Args:
-            color_mode: 'bgr' 或 'gray'，指定输出图像格式
-        """
+    def __init__(self):
+        """初始化相机"""
         self.cam = None
         self.device_list = None
         self.is_opened = False
-        self.color_mode = color_mode.lower()
 
         # 回调相关
         self._callback_func = None
@@ -163,13 +158,9 @@ class HikCamera:
 
     def _create_callback(self):
         """创建图像回调函数"""
-        # 根据颜色模式设置目标像素格式
-        if self.color_mode == "gray":
-            dst_pixel_type = PixelType_Gvsp_Mono8
-            channels = 1
-        else:
-            dst_pixel_type = PixelType_Gvsp_BGR8_Packed
-            channels = 3
+        # 固定使用BGR格式
+        dst_pixel_type = PixelType_Gvsp_BGR8_Packed
+        channels = 3
 
         # 预分配转换缓冲区（按最大分辨率预分配）
         max_buffer_size = 4096 * 3072 * channels
@@ -209,10 +200,9 @@ class HikCamera:
 
                 # 从预分配缓冲区直接构建numpy数组
                 frame_size = width * height * channels
-                shape = (height, width, channels) if channels > 1 else (height, width)
                 frame = np.frombuffer(
                     convert_buffer, dtype=np.uint8, count=frame_size
-                ).reshape(shape).copy()
+                ).reshape((height, width, channels)).copy()
 
                 # 更新最新帧
                 with cam_ref._lock:
@@ -239,7 +229,7 @@ class HikCamera:
         读取最新的一帧图像（返回副本）
         返回: (ret, frame)
             ret: bool, 是否成功读取
-            frame: numpy.ndarray, BGR或灰度格式的图像
+            frame: numpy.ndarray, BGR格式的图像
         """
         if not self.is_opened:
             return False, None

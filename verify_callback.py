@@ -19,7 +19,7 @@ def main():
     print("="*60)
 
     # 创建相机对象
-    camera = HikCamera(color_mode="bgr")
+    camera = HikCamera()
 
     # 初始化
     print("\n[1/4] 初始化SDK...")
