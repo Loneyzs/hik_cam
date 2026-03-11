@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 
 """
-测试1: 实时监看图像
-按 'q' 退出，按 's' 保存图像，按 'g' 切换灰度/彩色模式
+实时监看图像
+按 'q' 退出，按 's' 保存图像，按 '空格' 暂停/继续
 """
 
 import sys
@@ -14,14 +14,12 @@ from hik_camera import HikCamera
 
 
 def main():
-    # 创建相机对象（BGR模式）
-    camera = HikCamera(color_mode="bgr")
+    camera = HikCamera()
 
     if not camera.init():
         print("初始化失败")
         return
 
-    # 显示设备信息
     device_count = camera.device_list.nDeviceNum
     print(f"\n找到 {device_count} 个设备")
     for i in range(device_count):
@@ -29,7 +27,6 @@ def main():
         if info:
             print(f"设备 [{i}]: {info}")
 
-    # 打开相机
     if not camera.open(0):
         print("打开相机失败")
         return
@@ -45,11 +42,9 @@ def main():
     try:
         while True:
             if not paused:
-                # 读取最新帧（零拷贝）
                 ret, frame = camera.read_latest()
 
                 if ret:
-                    # 显示FPS
                     fps = camera.get_fps()
                     cv2.putText(
                         frame,
@@ -63,7 +58,6 @@ def main():
 
                     cv2.imshow("Hik Camera - Live View", frame)
 
-            # 处理按键
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord("q"):
@@ -88,3 +82,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
